@@ -18,6 +18,7 @@ inputs:
 outputs:
   target-service:
     description: 'The name of the target service'
+    value: ${{ steps.resolve-target-service.outputs.service }}
 
 runs:
   using: composite
@@ -38,6 +39,7 @@ runs:
         fi
 
     - name: Resolve target service from compose (when unset)
+      id: resolve-target-service
       if: inputs.target-service == ''
       shell: bash
       env:
