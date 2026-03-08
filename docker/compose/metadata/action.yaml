@@ -1,0 +1,62 @@
+name: compose-metadata
+description: 'Verifies the docker compose metadata'
+author: marcello.desales@gmail.com
+branding:
+  color: blue
+  icon: watch
+
+inputs:
+  compose-path: 
+    description: 'The name of the docker compose file'
+    required: false
+    default: docker-compose.yaml
+
+  target-service:
+    description: 'valid docker compose target service'
+    required: false
+
+outputs:
+  target-service:
+    description: 'The name of the target service'
+
+runs:
+  using: composite
+  
+  steps:
+    - name: If the file does not exist, fail
+      shell: bash
+      env:
+        DOCKER_COMPOSE_FILE_NAME: ${{ inputs.compose-path }}
+      run: |
+        if [ -z "${DOCKER_COMPOSE_FILE_NAME}" ]; then
+          echo "::error::Please set input 'compose-path' to the docker compose file to use, or use the default"
+          exit 1
+        fi
+        if [ ! -f "${DOCKER_COMPOSE_FILE_NAME}" ]; then
+          echo "::error::The input 'compose-path=${DOCKER_COMPOSE_FILE_NAME}' points to a docker compose file that does not exist"
+          exit 1
+        fi
+
+    - name: Resolve target service from compose (when unset)
+      if: inputs.target-service == ''
+      shell: bash
+      env:
+        DOCKER_COMPOSE_FILE_NAME: ${{ inputs.compose-path }}
+      run: |
+        set -euo pipefail
+        mapfile -t SERVICES < <(docker compose -f "${{ env.DOCKER_COMPOSE_FILE_NAME }}" config --services)
+
+        if [ "${#SERVICES[@]}" -eq 0 ]; then
+          echo "::error::No services were found in ${{ env.DOCKER_COMPOSE_FILE_NAME }}."
+          exit 1
+        fi
+
+        if [ "${#SERVICES[@]}" -eq 1 ]; then
+          echo "Single compose service detected: ${SERVICES[0]}"
+          echo "service=${SERVICES[0]}" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "::error::Multiple services found in ${{ env.DOCKER_COMPOSE_FILE_NAME }}: ${SERVICES[*]}"
+        echo "::error::Please set input 'target-service' to the service you want to build."
+        exit 1
