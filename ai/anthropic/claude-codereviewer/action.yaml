@@ -1,0 +1,257 @@
+name: "Anthropic Code Review"
+description: "Runs a markdown code-review prompt through Anthropic with retries and fallback models."
+author: "vionix-platform"
+
+branding:
+  icon: "message-square"
+  color: "purple"
+
+inputs:
+  anthropic-api-key:
+    description: "Anthropic API key."
+    required: true
+
+  prompt:
+    description: "The full review prompt to send to Anthropic."
+    required: true
+
+  anthropic-base-url:
+    description: "Anthropic API base URL."
+    required: false
+    default: "https://api.anthropic.com"
+
+  anthropic-version:
+    description: "Anthropic API version header."
+    required: false
+    default: "2023-06-01"
+
+  anthropic-models:
+    description: "Comma-separated Anthropic models to try in order."
+    required: false
+    default: "claude-opus-4-6,claude-sonnet-4-6,claude-haiku-4-5"
+
+  anthropic-max-tokens:
+    description: "Maximum tokens for the Anthropic response."
+    required: false
+    default: "1200"
+
+  anthropic-temperature:
+    description: "Temperature for the Anthropic request."
+    required: false
+    default: "0.2"
+
+  anthropic-request-timeout-seconds:
+    description: "curl max-time for each Anthropic API request."
+    required: false
+    default: "120"
+
+  max-attempts-per-model:
+    description: "Maximum retry attempts per model."
+    required: false
+    default: "5"
+
+  initial-retry-sleep-seconds:
+    description: "Initial retry sleep duration. Doubles after each failed attempt."
+    required: false
+    default: "3"
+
+  fail-on-anthropic-error:
+    description: "If true, fail the action when all Anthropic model attempts fail."
+    required: false
+    default: "false"
+
+  output-file:
+    description: "Path where the Anthropic markdown response should be written."
+    required: false
+    default: ""
+
+outputs:
+  review-file:
+    description: "Path to the generated Anthropic review markdown file."
+    value: ${{ steps.review.outputs.review_file }}
+
+  review:
+    description: "Generated Anthropic review markdown."
+    value: ${{ steps.review.outputs.review }}
+
+  model:
+    description: "Anthropic model that produced the successful response."
+    value: ${{ steps.review.outputs.model }}
+
+  success:
+    description: "Whether Anthropic returned a successful text response."
+    value: ${{ steps.review.outputs.success }}
+
+runs:
+  using: "composite"
+
+  steps:
+    - name: Anthropic code review
+      id: review
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        REVIEW_PROMPT: ${{ inputs.prompt }}
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+        ANTHROPIC_VERSION: ${{ inputs.anthropic-version }}
+        ANTHROPIC_MODELS: ${{ inputs.anthropic-models }}
+        ANTHROPIC_MAX_TOKENS: ${{ inputs.anthropic-max-tokens }}
+        ANTHROPIC_TEMPERATURE: ${{ inputs.anthropic-temperature }}
+        ANTHROPIC_REQUEST_TIMEOUT_SECONDS: ${{ inputs.anthropic-request-timeout-seconds }}
+        MAX_ATTEMPTS_PER_MODEL: ${{ inputs.max-attempts-per-model }}
+        INITIAL_RETRY_SLEEP_SECONDS: ${{ inputs.initial-retry-sleep-seconds }}
+        FAIL_ON_ANTHROPIC_ERROR: ${{ inputs.fail-on-anthropic-error }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+      run: |
+        set -euo pipefail
+
+        BASE_URL="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+
+        workdir="${RUNNER_TEMP}/anthropic-code-review"
+        mkdir -p "${workdir}"
+
+        prompt_path="${workdir}/prompt.txt"
+        request_path="${workdir}/anthropic-request.json"
+        response_path="${workdir}/anthropic-response.json"
+
+        if [[ -n "${OUTPUT_FILE:-}" ]]; then
+          review_file="${OUTPUT_FILE}"
+          mkdir -p "$(dirname "${review_file}")"
+        else
+          review_file="${workdir}/review.md"
+        fi
+
+        printf '%s' "${REVIEW_PROMPT}" > "${prompt_path}"
+
+        success=0
+        successful_model=""
+
+        if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+          echo "_Anthropic API key was not provided._" > "${review_file}"
+
+          if [[ "${FAIL_ON_ANTHROPIC_ERROR}" == "true" ]]; then
+            echo "ANTHROPIC_API_KEY is required."
+            exit 1
+          fi
+
+          {
+            echo "review_file=${review_file}"
+            echo "model="
+            echo "success=false"
+          } >> "${GITHUB_OUTPUT}"
+
+          delimiter="anthropic_review_$(date +%s%N)"
+          {
+            echo "review<<${delimiter}"
+            cat "${review_file}"
+            echo "${delimiter}"
+          } >> "${GITHUB_OUTPUT}"
+
+          exit 0
+        fi
+
+        IFS=',' read -r -a models <<< "${ANTHROPIC_MODELS}"
+
+        for raw_model in "${models[@]}"; do
+          model="$(printf '%s' "${raw_model}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+          if [[ -z "${model}" ]]; then
+            continue
+          fi
+
+          echo "Trying Anthropic model: ${model}"
+
+          jq -n \
+            --rawfile prompt "${prompt_path}" \
+            --arg model "${model}" \
+            --arg max_tokens "${ANTHROPIC_MAX_TOKENS}" \
+            --arg temperature "${ANTHROPIC_TEMPERATURE}" \
+            '{
+              model: $model,
+              max_tokens: ($max_tokens | tonumber),
+              temperature: ($temperature | tonumber),
+              messages: [
+                {
+                  role: "user",
+                  content: $prompt
+                }
+              ]
+            }' > "${request_path}"
+
+          attempt=1
+          max_attempts="${MAX_ATTEMPTS_PER_MODEL}"
+          sleep_secs="${INITIAL_RETRY_SLEEP_SECONDS}"
+
+          while [[ "${attempt}" -le "${max_attempts}" ]]; do
+            echo "Anthropic request attempt ${attempt}/${max_attempts} for model ${model}..."
+
+            http_code="$(curl -sS \
+              --max-time "${ANTHROPIC_REQUEST_TIMEOUT_SECONDS}" \
+              -o "${response_path}" \
+              -w "%{http_code}" \
+              "${BASE_URL}/v1/messages" \
+              -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+              -H "anthropic-version: ${ANTHROPIC_VERSION}" \
+              -H "content-type: application/json" \
+              -d @"${request_path}" || true)"
+
+            if [[ "${http_code}" == "200" ]] && jq -e '.content | length > 0' "${response_path}" >/dev/null 2>&1; then
+              jq -r '.content[]? | select(.type=="text") | .text' "${response_path}" > "${review_file}"
+              success=1
+              successful_model="${model}"
+              break
+            fi
+
+            echo "Attempt ${attempt} failed for model ${model}. HTTP ${http_code}."
+
+            if [[ "${attempt}" -lt "${max_attempts}" ]]; then
+              echo "Retrying in ${sleep_secs}s..."
+              sleep "${sleep_secs}"
+              sleep_secs=$((sleep_secs * 2))
+            fi
+
+            attempt=$((attempt + 1))
+          done
+
+          if [[ "${success}" -eq 1 ]]; then
+            break
+          fi
+        done
+
+        if [[ "${success}" -ne 1 ]]; then
+          {
+            echo "_Anthropic API request failed after trying all configured models._"
+            echo
+            echo "Base URL: \`${BASE_URL}\`"
+            echo
+            echo "Configured models: \`${ANTHROPIC_MODELS}\`"
+            echo
+            echo "Last known response truncated:"
+            echo
+            echo '```json'
+            head -c 3000 "${response_path}" || true
+            echo
+            echo '```'
+          } > "${review_file}"
+
+          if [[ "${FAIL_ON_ANTHROPIC_ERROR}" == "true" ]]; then
+            exit 1
+          fi
+        fi
+
+        if [[ ! -s "${review_file}" ]]; then
+          echo "_Anthropic API returned no text content._" > "${review_file}"
+        fi
+
+        {
+          echo "review_file=${review_file}"
+          echo "model=${successful_model}"
+          echo "success=$([[ "${success}" -eq 1 ]] && echo true || echo false)"
+        } >> "${GITHUB_OUTPUT}"
+
+        delimiter="anthropic_review_$(date +%s%N)"
+        {
+          echo "review<<${delimiter}"
+          cat "${review_file}"
+          echo "${delimiter}"
+        } >> "${GITHUB_OUTPUT}"
