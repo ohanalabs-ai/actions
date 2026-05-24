@@ -1,0 +1,624 @@
+name: "Dependabot Reviewer - Anthropic"
+description: "Reviews Dependabot pull requests with Anthropic and posts/updates a PR review comment."
+author: "vionix-platform"
+
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  github-token:
+    description: "GitHub token used to read PR metadata, checks/statuses, and create/update PR comments."
+    required: false
+    default: ${{ github.token }}
+
+  anthropic-api-key:
+    description: "Anthropic API key."
+    required: true
+
+  anthropic-base-url:
+    description: "Anthropic API base URL."
+    required: false
+    default: "https://api.anthropic.com"
+
+  anthropic-version:
+    description: "Anthropic API version header."
+    required: false
+    default: "2023-06-01"
+
+  anthropic-models:
+    description: "Comma-separated Anthropic models to try in order."
+    required: false
+    default: "claude-opus-4-6,claude-sonnet-4-6,claude-haiku-4-5"
+
+  anthropic-max-tokens:
+    description: "Maximum tokens for the Anthropic response."
+    required: false
+    default: "1200"
+
+  anthropic-temperature:
+    description: "Temperature for the Anthropic request."
+    required: false
+    default: "0.2"
+
+  anthropic-request-timeout-seconds:
+    description: "curl max-time for each Anthropic API request."
+    required: false
+    default: "120"
+
+  max-attempts-per-model:
+    description: "Maximum retry attempts per model."
+    required: false
+    default: "5"
+
+  initial-retry-sleep-seconds:
+    description: "Initial retry sleep duration. Doubles after each failed attempt."
+    required: false
+    default: "3"
+
+  pr-body-max-chars:
+    description: "Maximum number of PR body characters to include in the Anthropic prompt."
+    required: false
+    default: "8000"
+
+  dependency-names-max-chars:
+    description: "Maximum number of dependency-name characters to include in the Anthropic prompt."
+    required: false
+    default: "4000"
+
+  require-dependabot:
+    description: "If true, the action only runs for Dependabot-authored PRs."
+    required: false
+    default: "true"
+
+  include-ci-signal:
+    description: "If true, gather legacy commit statuses and check runs for the PR head SHA."
+    required: false
+    default: "true"
+
+  publish-summary:
+    description: "If true, publish the generated review to the GitHub Actions job summary."
+    required: false
+    default: "true"
+
+  post-comment:
+    description: "If true, create or update a PR comment with the generated review."
+    required: false
+    default: "true"
+
+  update-existing-comment:
+    description: "If true, update an existing bot comment containing the comment marker instead of creating a new comment."
+    required: false
+    default: "true"
+
+  comment-marker:
+    description: "Marker used to find an existing PR comment to update."
+    required: false
+    default: "## 🤖 Dependabot Dependency Review"
+
+  review-title:
+    description: "Markdown heading used at the top of the generated review."
+    required: false
+    default: "## 🤖 Dependabot Dependency Review"
+
+  extra-prompt:
+    description: "Additional instructions appended to the Anthropic review prompt."
+    required: false
+    default: ""
+
+  fail-on-anthropic-error:
+    description: "If true, fail the action when all Anthropic model attempts fail. If false, publish a fallback review."
+    required: false
+    default: "false"
+
+outputs:
+  should-run:
+    description: "Whether the reviewer ran for this event."
+    value: ${{ steps.guard.outputs.should_run }}
+
+  review-body-path:
+    description: "Path to the generated review markdown file."
+    value: ${{ steps.paths.outputs.review_body_path }}
+
+  ai-opinion-path:
+    description: "Path to the generated AI opinion markdown file."
+    value: ${{ steps.paths.outputs.ai_opinion_path }}
+
+  review-body:
+    description: "Generated review body."
+    value: ${{ steps.final.outputs.review_body }}
+
+runs:
+  using: "composite"
+
+  steps:
+    - name: Determine whether reviewer should run
+      id: guard
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        PR_USER_LOGIN: ${{ github.event.pull_request.user.login }}
+        ACTOR: ${{ github.actor }}
+        REQUIRE_DEPENDABOT: ${{ inputs.require-dependabot }}
+      run: |
+        set -euo pipefail
+
+        should_run="true"
+
+        if [[ "${EVENT_NAME}" != "pull_request" && "${EVENT_NAME}" != "pull_request_target" ]]; then
+          echo "This action only supports pull_request or pull_request_target events."
+          should_run="false"
+        fi
+
+        if [[ "${REQUIRE_DEPENDABOT}" == "true" ]]; then
+          if [[ "${PR_USER_LOGIN:-}" != "dependabot[bot]" && "${ACTOR:-}" != "dependabot[bot]" ]]; then
+            echo "Skipping because this PR was not opened by Dependabot."
+            should_run="false"
+          fi
+        fi
+
+        echo "should_run=${should_run}" >> "${GITHUB_OUTPUT}"
+
+    - name: Prepare workspace paths
+      id: paths
+      if: ${{ steps.guard.outputs.should_run == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        workdir="${RUNNER_TEMP}/dependabot-reviewer-anthropic"
+        mkdir -p "${workdir}"
+
+        echo "workdir=${workdir}" >> "${GITHUB_OUTPUT}"
+        echo "review_body_path=${workdir}/review.md" >> "${GITHUB_OUTPUT}"
+        echo "ai_opinion_path=${workdir}/ai-opinion.md" >> "${GITHUB_OUTPUT}"
+        echo "prompt_path=${workdir}/ai-prompt.txt" >> "${GITHUB_OUTPUT}"
+        echo "request_path=${workdir}/anthropic-request.json" >> "${GITHUB_OUTPUT}"
+        echo "response_path=${workdir}/anthropic-response.json" >> "${GITHUB_OUTPUT}"
+
+    - name: Fetch metadata from Dependabot PR
+      id: metadata
+      if: ${{ steps.guard.outputs.should_run == 'true' }}
+      uses: dependabot/fetch-metadata@v3.0.0
+      with:
+        github-token: ${{ inputs.github-token }}
+
+    - name: Gather CI signal for PR head SHA
+      id: ci
+      if: ${{ steps.guard.outputs.should_run == 'true' && inputs.include-ci-signal == 'true' }}
+      uses: actions/github-script@v9.0.0
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const sha = context.payload.pull_request.head.sha;
+          const { owner, repo } = context.repo;
+
+          let state = 'unknown';
+          let total = 0;
+          let checkTotal = 0;
+          let checkFailed = 0;
+
+          try {
+            const statusResp = await github.rest.repos.getCombinedStatusForRef({
+              owner,
+              repo,
+              ref: sha,
+            });
+
+            state = statusResp.data.state || 'unknown';
+            total = Array.isArray(statusResp.data.statuses)
+              ? statusResp.data.statuses.length
+              : 0;
+          } catch (e) {
+            core.warning(`Failed to get combined status: ${e.message}`);
+          }
+
+          try {
+            const checksResp = await github.rest.checks.listForRef({
+              owner,
+              repo,
+              ref: sha,
+              per_page: 100,
+            });
+
+            const checkRuns = checksResp.data.check_runs || [];
+            checkTotal = checksResp.data.total_count ?? checkRuns.length;
+
+            const failingConclusions = new Set([
+              'failure',
+              'timed_out',
+              'cancelled',
+              'startup_failure',
+            ]);
+
+            checkFailed = checkRuns.filter(run =>
+              failingConclusions.has(run.conclusion)
+            ).length;
+          } catch (e) {
+            core.warning(`Failed to get check runs: ${e.message}`);
+          }
+
+          core.setOutput('status_state', state);
+          core.setOutput('status_total', String(total));
+          core.setOutput('check_total', String(checkTotal));
+          core.setOutput('check_failed', String(checkFailed));
+
+    - name: Build base review body
+      if: ${{ steps.guard.outputs.should_run == 'true' }}
+      shell: bash
+      env:
+        REVIEW_MD: ${{ steps.paths.outputs.review_body_path }}
+        REVIEW_TITLE: ${{ inputs.review-title }}
+        DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+        DEP_TYPE: ${{ steps.metadata.outputs.dependency-type }}
+        UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+        ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+        DIRECTORY: ${{ steps.metadata.outputs.directory }}
+        TARGET_BRANCH: ${{ steps.metadata.outputs.target-branch }}
+        CI_STATE: ${{ steps.ci.outputs.status_state }}
+        CI_TOTAL: ${{ steps.ci.outputs.status_total }}
+        CHECK_TOTAL: ${{ steps.ci.outputs.check_total }}
+        CHECK_FAILED: ${{ steps.ci.outputs.check_failed }}
+      run: |
+        set -euo pipefail
+
+        cat > "${REVIEW_MD}" <<EOF
+        ${REVIEW_TITLE}
+
+        ### Metadata
+        - **Dependency names**: \`${DEP_NAMES:-unknown}\`
+        - **Dependency type**: \`${DEP_TYPE:-unknown}\` usually \`direct:production\`, \`direct:development\`, or \`indirect\`
+        - **Update type**: \`${UPDATE_TYPE:-unknown}\`
+        - **Ecosystem**: \`${ECOSYSTEM:-unknown}\`
+        - **Directory**: \`${DIRECTORY:-unknown}\`
+        - **Target branch**: \`${TARGET_BRANCH:-unknown}\`
+
+        ### 1) Direct vs Transitive classification
+        EOF
+
+        if [[ "${DEP_TYPE:-}" == indirect* ]]; then
+          cat >> "${REVIEW_MD}" <<EOF
+        - **Classification**: ✅ **Transitive** \`${DEP_TYPE}\`.
+        - **Reasoning**: Dependabot marks this as \`indirect\`, meaning it is pulled by another dependency, often lockfile driven.
+        EOF
+        elif [[ "${DEP_TYPE:-}" == direct* ]]; then
+          cat >> "${REVIEW_MD}" <<EOF
+        - **Classification**: ✅ **Direct** \`${DEP_TYPE}\`.
+        - **Reasoning**: Dependabot marks this as \`direct:*\`, meaning it is explicitly declared in project manifests.
+        EOF
+        else
+          cat >> "${REVIEW_MD}" <<EOF
+        - **Classification**: ⚠️ **Unknown** from metadata.
+        - **Fallback**: verify manifest vs lockfile diff for final determination.
+        EOF
+        fi
+
+        cat >> "${REVIEW_MD}" <<EOF
+
+        ### 2) Build/Artifact/Test verification context
+        - **Commit status**: \`${CI_STATE:-unknown}\`
+        - **Legacy statuses**: \`${CI_TOTAL:-0}\`
+        - **Check runs**: \`${CHECK_TOTAL:-0}\` total, \`${CHECK_FAILED:-0}\` failed
+        - Verification of where this dependency is used may require:
+          - dependency graph/SBOM/build artifacts,
+          - runtime and integration test execution paths.
+        - If no static reference exists, usage may still be real via transitive/runtime loading.
+
+        EOF
+
+    - name: AI dependency impact review
+      if: ${{ steps.guard.outputs.should_run == 'true' }}
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+        ANTHROPIC_VERSION: ${{ inputs.anthropic-version }}
+        ANTHROPIC_MODELS: ${{ inputs.anthropic-models }}
+        ANTHROPIC_MAX_TOKENS: ${{ inputs.anthropic-max-tokens }}
+        ANTHROPIC_TEMPERATURE: ${{ inputs.anthropic-temperature }}
+        ANTHROPIC_REQUEST_TIMEOUT_SECONDS: ${{ inputs.anthropic-request-timeout-seconds }}
+        MAX_ATTEMPTS_PER_MODEL: ${{ inputs.max-attempts-per-model }}
+        INITIAL_RETRY_SLEEP_SECONDS: ${{ inputs.initial-retry-sleep-seconds }}
+        PR_BODY_MAX_CHARS: ${{ inputs.pr-body-max-chars }}
+        DEPENDENCY_NAMES_MAX_CHARS: ${{ inputs.dependency-names-max-chars }}
+        FAIL_ON_ANTHROPIC_ERROR: ${{ inputs.fail-on-anthropic-error }}
+        EXTRA_PROMPT: ${{ inputs.extra-prompt }}
+        PROMPT_PATH: ${{ steps.paths.outputs.prompt_path }}
+        REQUEST_PATH: ${{ steps.paths.outputs.request_path }}
+        RESPONSE_PATH: ${{ steps.paths.outputs.response_path }}
+        AI_OPINION_PATH: ${{ steps.paths.outputs.ai_opinion_path }}
+        DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+        DEP_TYPE: ${{ steps.metadata.outputs.dependency-type }}
+        UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+        ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+        DIRECTORY: ${{ steps.metadata.outputs.directory }}
+        TARGET_BRANCH: ${{ steps.metadata.outputs.target-branch }}
+        CI_STATE: ${{ steps.ci.outputs.status_state }}
+        CI_TOTAL: ${{ steps.ci.outputs.status_total }}
+        CHECK_TOTAL: ${{ steps.ci.outputs.check_total }}
+        CHECK_FAILED: ${{ steps.ci.outputs.check_failed }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+
+        BASE_URL="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+
+        if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+          echo "_Anthropic API key was not provided._" > "${AI_OPINION_PATH}"
+
+          if [[ "${FAIL_ON_ANTHROPIC_ERROR}" == "true" ]]; then
+            echo "ANTHROPIC_API_KEY is required."
+            exit 1
+          fi
+
+          exit 0
+        fi
+
+        PR_BODY_RAW="${PR_BODY:-}"
+        PR_BODY_TRUNC="${PR_BODY_RAW:0:${PR_BODY_MAX_CHARS}}"
+
+        DEP_NAMES_RAW="${DEP_NAMES:-}"
+        DEP_NAMES_TRUNC="${DEP_NAMES_RAW:0:${DEPENDENCY_NAMES_MAX_CHARS}}"
+
+        if [[ -n "${DEP_NAMES_RAW}" ]]; then
+          _commas="${DEP_NAMES_RAW//[^,]/}"
+          DEP_COUNT=$(( ${#_commas} + 1 ))
+        else
+          DEP_COUNT=0
+        fi
+
+        if (( DEP_COUNT > 1 )); then
+          UPDATE_SHAPE="grouped update (${DEP_COUNT} packages)"
+        elif (( DEP_COUNT == 1 )); then
+          UPDATE_SHAPE="single-package update"
+        else
+          UPDATE_SHAPE="unknown"
+        fi
+
+        cat > "${PROMPT_PATH}" <<EOF
+        You are reviewing a Dependabot pull request.
+
+        REPO: ${REPO}
+        PR NUMBER: ${PR_NUMBER}
+        PR TITLE: ${PR_TITLE}
+        PR BODY truncated to ${PR_BODY_MAX_CHARS} chars:
+        ${PR_BODY_TRUNC}
+
+        DEPENDABOT METADATA
+        - Update shape: ${UPDATE_SHAPE}
+        - Dependency count: ${DEP_COUNT}
+        - Dependency names truncated: ${DEP_NAMES_TRUNC}
+        - Dependency type: ${DEP_TYPE}
+        - Update type: ${UPDATE_TYPE}
+        - Ecosystem: ${ECOSYSTEM}
+        - Directory: ${DIRECTORY}
+        - Target branch: ${TARGET_BRANCH}
+
+        CI SIGNALS
+        - Commit status state: ${CI_STATE:-unknown}
+        - Legacy statuses count: ${CI_TOTAL:-0}
+        - Check runs total: ${CHECK_TOTAL:-0}
+        - Check runs failed: ${CHECK_FAILED:-0}
+
+        TASKS:
+        Handle both single-package and grouped Dependabot updates. If this is a
+        grouped update with Dependency count > 1, analyze each listed package
+        briefly rather than treating the whole group as a single bump.
+
+        1) Confirm direct vs transitive classification from metadata.
+           - For grouped updates, state it per package when it differs.
+        2) Verify what this dependency, or each packaged dependency in a group,
+           could affect in this repository.
+        3) Assess broken-build merge risk for the group as a whole and call out
+           any individual package that is higher risk, such as majors, ecosystem
+           splits, SDK rewrites, runtime/framework/compiler changes, or security
+           tooling changes.
+        4) Provide:
+           - Risk level: LOW | MEDIUM | HIGH for the PR as a whole
+           - Per-package risk table when grouped: package | risk | why
+           - Recommendation: MERGE | HOLD | INVESTIGATE
+           - concise rationale
+           - next actions
+           - suggest a follow-up issue only when test/runtime evidence is required.
+
+        Output markdown only.
+        EOF
+
+        if [[ -n "${EXTRA_PROMPT:-}" ]]; then
+          cat >> "${PROMPT_PATH}" <<EOF
+
+        ADDITIONAL REVIEW INSTRUCTIONS:
+        ${EXTRA_PROMPT}
+        EOF
+        fi
+
+        IFS=',' read -r -a models <<< "${ANTHROPIC_MODELS}"
+
+        success=0
+
+        for raw_model in "${models[@]}"; do
+          model="$(printf '%s' "${raw_model}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+          if [[ -z "${model}" ]]; then
+            continue
+          fi
+
+          echo "Trying Anthropic model: ${model}"
+
+          jq -n \
+            --rawfile prompt "${PROMPT_PATH}" \
+            --arg model "${model}" \
+            --arg max_tokens "${ANTHROPIC_MAX_TOKENS}" \
+            --arg temperature "${ANTHROPIC_TEMPERATURE}" \
+            '{
+              model: $model,
+              max_tokens: ($max_tokens | tonumber),
+              temperature: ($temperature | tonumber),
+              messages: [
+                {
+                  role: "user",
+                  content: $prompt
+                }
+              ]
+            }' > "${REQUEST_PATH}"
+
+          attempt=1
+          max_attempts="${MAX_ATTEMPTS_PER_MODEL}"
+          sleep_secs="${INITIAL_RETRY_SLEEP_SECONDS}"
+
+          while [[ "${attempt}" -le "${max_attempts}" ]]; do
+            echo "Anthropic request attempt ${attempt}/${max_attempts} for model ${model}..."
+
+            http_code="$(curl -sS \
+              --max-time "${ANTHROPIC_REQUEST_TIMEOUT_SECONDS}" \
+              -o "${RESPONSE_PATH}" \
+              -w "%{http_code}" \
+              "${BASE_URL}/v1/messages" \
+              -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+              -H "anthropic-version: ${ANTHROPIC_VERSION}" \
+              -H "content-type: application/json" \
+              -d @"${REQUEST_PATH}" || true)"
+
+            if [[ "${http_code}" == "200" ]] && jq -e '.content | length > 0' "${RESPONSE_PATH}" >/dev/null 2>&1; then
+              jq -r '.content[]? | select(.type=="text") | .text' "${RESPONSE_PATH}" > "${AI_OPINION_PATH}"
+              success=1
+              break
+            fi
+
+            echo "Attempt ${attempt} failed for model ${model}. HTTP ${http_code}."
+
+            if [[ "${attempt}" -lt "${max_attempts}" ]]; then
+              echo "Retrying in ${sleep_secs}s..."
+              sleep "${sleep_secs}"
+              sleep_secs=$((sleep_secs * 2))
+            fi
+
+            attempt=$((attempt + 1))
+          done
+
+          if [[ "${success}" -eq 1 ]]; then
+            break
+          fi
+        done
+
+        if [[ "${success}" -ne 1 ]]; then
+          {
+            echo "_Anthropic API request failed after trying all configured models._"
+            echo
+            echo "Base URL: \`${BASE_URL}\`"
+            echo
+            echo "Configured models: \`${ANTHROPIC_MODELS}\`"
+            echo
+            echo "Last known response truncated:"
+            echo
+            echo '```json'
+            head -c 3000 "${RESPONSE_PATH}" || true
+            echo
+            echo '```'
+          } > "${AI_OPINION_PATH}"
+
+          if [[ "${FAIL_ON_ANTHROPIC_ERROR}" == "true" ]]; then
+            exit 1
+          fi
+        fi
+
+        if [[ ! -s "${AI_OPINION_PATH}" ]]; then
+          echo "_Anthropic API returned no text content._" > "${AI_OPINION_PATH}"
+        fi
+
+    - name: Append AI opinion to unified review
+      if: ${{ steps.guard.outputs.should_run == 'true' }}
+      shell: bash
+      env:
+        REVIEW_MD: ${{ steps.paths.outputs.review_body_path }}
+        AI_OPINION_PATH: ${{ steps.paths.outputs.ai_opinion_path }}
+      run: |
+        set -euo pipefail
+
+        {
+          echo "### 3) AI risk opinion"
+          echo
+
+          if [[ -s "${AI_OPINION_PATH}" ]]; then
+            cat "${AI_OPINION_PATH}"
+          else
+            echo "_Skipped: AI opinion not generated._"
+          fi
+        } >> "${REVIEW_MD}"
+
+    - name: Publish job summary
+      if: ${{ steps.guard.outputs.should_run == 'true' && inputs.publish-summary == 'true' }}
+      shell: bash
+      env:
+        REVIEW_MD: ${{ steps.paths.outputs.review_body_path }}
+      run: |
+        set -euo pipefail
+        cat "${REVIEW_MD}" >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Upsert PR comment
+      if: ${{ steps.guard.outputs.should_run == 'true' && inputs.post-comment == 'true' }}
+      uses: actions/github-script@v9.0.0
+      env:
+        REVIEW_MD: ${{ steps.paths.outputs.review_body_path }}
+        COMMENT_MARKER: ${{ inputs.comment-marker }}
+        UPDATE_EXISTING_COMMENT: ${{ inputs.update-existing-comment }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+
+          const body = fs.readFileSync(process.env.REVIEW_MD, 'utf8');
+          const marker = process.env.COMMENT_MARKER;
+          const updateExisting = process.env.UPDATE_EXISTING_COMMENT === 'true';
+
+          const { owner, repo } = context.repo;
+          const issue_number = context.payload.pull_request.number;
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner,
+            repo,
+            issue_number,
+            per_page: 100,
+          });
+
+          const existing = comments.find(comment =>
+            comment.user?.type === 'Bot' &&
+            comment.body &&
+            comment.body.includes(marker)
+          );
+
+          if (existing && updateExisting) {
+            await github.rest.issues.updateComment({
+              owner,
+              repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
+          }
+
+    - name: Expose final outputs
+      id: final
+      if: ${{ steps.guard.outputs.should_run == 'true' }}
+      shell: bash
+      env:
+        REVIEW_MD: ${{ steps.paths.outputs.review_body_path }}
+      run: |
+        set -euo pipefail
+
+        delimiter="review_body_$(date +%s%N)"
+
+        {
+          echo "review_body<<${delimiter}"
+          cat "${REVIEW_MD}"
+          echo "${delimiter}"
+        } >> "${GITHUB_OUTPUT}"
