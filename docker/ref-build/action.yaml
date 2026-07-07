@@ -86,22 +86,18 @@ runs:
       shell: bash
       env:
         IMAGE: ${{ steps.vars.outputs.ghcr_image_base }}
-        TAG: ${{ github.ref_name }}   # tag that triggered workflow
+        TAG: ${{ github.ref_name }}
       run: |
         set -euo pipefail
     
-        TAGS="${IMAGE}:${TAG}"
-    
-        # stable semver: v1.2.3 or 1.2.3
-        if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          TAGS="${TAGS},${IMAGE}:latest"
-          echo "is_stable_semver=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "is_stable_semver=false" >> "$GITHUB_OUTPUT"
-        fi
-    
-        echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-        echo "Using tags: ${TAGS}"
+        {
+          echo "tags<<EOF"
+          echo "${IMAGE}:${TAG}"
+          if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "${IMAGE}:latest"
+          fi
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
     
     - name: Build and push
       id: bake
