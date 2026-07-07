@@ -29,12 +29,18 @@ runs:
 
     - name: Verify bake targets from compose file
       shell: bash
+      id: verify
       run: |
         set -euo pipefail
         echo "Using compose file: ${{ inputs.docker-compose-file-name }}"
         test -f "${{ inputs.docker-compose-file-name }}" || (echo "::error::Compose file not found"; ls -la; exit 1)
         docker buildx version
         docker buildx bake -f "${{ inputs.docker-compose-file-name }}" --print
+        if [[ "${{ inputs.push-latest }}" == "true" ]]; then
+          echo "flavor-latest=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "flavor-latest=false" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
@@ -70,28 +76,10 @@ runs:
         print(f"Rewrote {n} image field(s) in {path}")
         PY
 
-    - name: Compute image tags
-      id: image_tags
-      shell: bash
-      env:
-        IMAGE: ${{ inputs.image-base }}
-        TAG: ${{ github.ref_name }}
-      run: |
-        set -euo pipefail
-        {
-          echo "tags<<EOF"
-          echo "${IMAGE}:${TAG}"
-          if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "${IMAGE}:latest"
-          fi
-          echo "EOF"
-        } >> "$GITHUB_OUTPUT"
-
     ## Validate if it's a tag or fail
 
     - name: Docker metadata - labels only
       id: meta
-      if: inputs.push-latest == 'false'
       uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
       with:
         images: ${{ inputs.image-base }}
@@ -100,21 +88,34 @@ runs:
           org.opencontainers.image.description=${{ inputs.image-description }}
           org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           org.opencontainers.image.revision=${{ github.sha }}
-        flavor: latest=false
+        flavor: latest=${{ steps.verify.outputs.flavor-latest }}
 
-    - name: Docker metadata - labels only
-      id: meta-latest
-      if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-') && inputs.push-latest == 'true'
-      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
-      with:
-        images: ${{ inputs.image-base }}
-        labels: |
-          org.opencontainers.image.title=${{ github.event.repository.name }}
-          org.opencontainers.image.description=${{ inputs.image-description }}
-          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-          org.opencontainers.image.revision=${{ github.sha }}
-        flavor: latest=true
+    - name: Build tag override lines
+      id: tag_overrides
+      shell: bash
+      env:
+        TARGET: ${{ steps.compose-metadata.outputs.target-service }}
+        REF_TAG: ${{ github.ref_name }}
+        PUSH_LATEST: ${{ inputs.push-latest }}
+        INPUT_TAGS: ${{ inputs.tags }}
+        IMAGE_BASE: ${{ inputs.image-base }}
+      run: |
+        set -euo pipefail
+        {
+          echo "lines<<EOF"
+          # inputs.tags can be multiline; each line is a full image ref
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            echo "${TARGET}.tags=${t}"
+          done <<< "${INPUT_TAGS}"
     
+          # add latest only on stable semver tags and when requested
+          if [[ "${PUSH_LATEST}" == "true" ]] && [[ "${REF_TAG}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "${TARGET}.tags=${IMAGE_BASE}:latest"
+          fi
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
     - name: Build and push
       id: bake
       uses: docker/bake-action@4a9a8d494466d37134e2bfca2d3a8de8fb2681ad
@@ -127,24 +128,7 @@ runs:
         builder: ${{ steps.buildx.outputs.name }}
         set: |
           ${{ steps.compose-metadata.outputs.target-service }}.platform=${{ inputs.platforms }}
-          ${{ steps.compose-metadata.outputs.target-service }}.tags=${{ steps.image_tags.outputs.tags }}
-          ${{ steps.compose-metadata.outputs.target-service }}.cache-from=type=gha,scope=${{ steps.compose-metadata.outputs.target-service }}
-          ${{ steps.compose-metadata.outputs.target-service }}.cache-to=type=gha,mode=max,scope=${{ steps.compose-metadata.outputs.target-service }}
-
-    - name: Build and push latest
-      if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-') && inputs.push-latest == 'true'
-      id: bake_latest
-      uses: docker/bake-action@4a9a8d494466d37134e2bfca2d3a8de8fb2681ad
-      with:
-        files: |
-          ${{ inputs.docker-compose-file-name }}
-          ${{ steps.meta-latest.outputs.bake-file-labels }}
-        targets: ${{ steps.compose-metadata.outputs.target-service }}
-        push: true
-        builder: ${{ steps.buildx.outputs.name }}
-        set: |
-          ${{ steps.compose-metadata.outputs.target-service }}.platform=${{ inputs.platforms }}
-          ${{ steps.compose-metadata.outputs.target-service }}.tags=${{ inputs.image-base }}:latest
+          ${{ steps.tag_overrides.outputs.lines }}
           ${{ steps.compose-metadata.outputs.target-service }}.cache-from=type=gha,scope=${{ steps.compose-metadata.outputs.target-service }}
           ${{ steps.compose-metadata.outputs.target-service }}.cache-to=type=gha,mode=max,scope=${{ steps.compose-metadata.outputs.target-service }}
 
