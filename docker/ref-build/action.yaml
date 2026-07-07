@@ -74,11 +74,10 @@ runs:
       id: image_tags
       shell: bash
       env:
-        IMAGE: ${{ steps.vars.outputs.ghcr_image_base }}
+        IMAGE: ${{ inputs.image-base }}
         TAG: ${{ github.ref_name }}
       run: |
         set -euo pipefail
-    
         {
           echo "tags<<EOF"
           echo "${IMAGE}:${TAG}"
@@ -145,7 +144,7 @@ runs:
         builder: ${{ steps.buildx.outputs.name }}
         set: |
           ${{ steps.compose-metadata.outputs.target-service }}.platform=${{ inputs.platforms }}
-          ${{ steps.compose-metadata.outputs.target-service }}.tags=${{ steps.vars.outputs.ghcr_image_base }}
+          ${{ steps.compose-metadata.outputs.target-service }}.tags=${{ inputs.image-base }}:latest
           ${{ steps.compose-metadata.outputs.target-service }}.cache-from=type=gha,scope=${{ steps.compose-metadata.outputs.target-service }}
           ${{ steps.compose-metadata.outputs.target-service }}.cache-to=type=gha,mode=max,scope=${{ steps.compose-metadata.outputs.target-service }}
 
