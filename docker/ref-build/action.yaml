@@ -1,5 +1,22 @@
 name: Docker ref build
 description: Builds a docker image for a ref reference (branch or tag)
+
+inputs:
+  registry: { required: true }
+  platforms: { required: true }
+  docker-compose-context: { required: true }
+  docker-compose-file-name: { required: true }
+  image-base: { required: true }
+  image-description: { required: true }
+  tags: { required: true }
+  push-attestations: { required: true }
+  sbom-file: { required: true }
+outputs:
+  digest:
+    value: ${{ steps.digest.outputs.digest }}
+  labels:
+    value: ${{ steps.meta.outputs.labels }}
+
 runs:
   using: composite
   steps:
@@ -64,6 +81,28 @@ runs:
           org.opencontainers.image.revision=${{ github.sha }}
         flavor: latest=false
 
+    - name: Compute image tags
+      id: image_tags
+      shell: bash
+      env:
+        IMAGE: ${{ steps.vars.outputs.ghcr_image_base }}
+        TAG: ${{ github.ref_name }}   # tag that triggered workflow
+      run: |
+        set -euo pipefail
+    
+        TAGS="${IMAGE}:${TAG}"
+    
+        # stable semver: v1.2.3 or 1.2.3
+        if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          TAGS="${TAGS},${IMAGE}:latest"
+          echo "is_stable_semver=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "is_stable_semver=false" >> "$GITHUB_OUTPUT"
+        fi
+    
+        echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+        echo "Using tags: ${TAGS}"
+    
     - name: Build and push
       id: bake
       uses: docker/bake-action@4a9a8d494466d37134e2bfca2d3a8de8fb2681ad
@@ -76,7 +115,7 @@ runs:
         builder: ${{ steps.buildx.outputs.name }}
         set: |
           ${{ steps.compose-metadata.outputs.target-service }}.platform=${{ inputs.platforms }}
-          ${{ steps.compose-metadata.outputs.target-service }}.tags=${{ inputs.tags }}
+          ${{ steps.compose-metadata.outputs.target-service }}.tags=${{ steps.image_tags.outputs.tags }}
           ${{ steps.compose-metadata.outputs.target-service }}.cache-from=type=gha,scope=${{ steps.compose-metadata.outputs.target-service }}
           ${{ steps.compose-metadata.outputs.target-service }}.cache-to=type=gha,mode=max,scope=${{ steps.compose-metadata.outputs.target-service }}
 
@@ -117,18 +156,3 @@ runs:
         push-to-registry: ${{ inputs.push-attestations }}
         show-summary: true
 
-inputs:
-  registry: { required: true }
-  platforms: { required: true }
-  docker-compose-context: { required: true }
-  docker-compose-file-name: { required: true }
-  image-base: { required: true }
-  image-description: { required: true }
-  tags: { required: true }
-  push-attestations: { required: true }
-  sbom-file: { required: true }
-outputs:
-  digest:
-    value: ${{ steps.digest.outputs.digest }}
-  labels:
-    value: ${{ steps.meta.outputs.labels }}
