@@ -104,7 +104,7 @@ runs:
         flavor: latest=false
 
     - name: Docker metadata - labels only
-      id: meta
+      id: meta-latest
       if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-') && inputs.push-latest == 'true'
       uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
       with:
@@ -139,7 +139,7 @@ runs:
       with:
         files: |
           ${{ inputs.docker-compose-file-name }}
-          ${{ steps.meta.outputs.bake-file-labels }}
+          ${{ steps.meta-latest.outputs.bake-file-labels }}
         targets: ${{ steps.compose-metadata.outputs.target-service }}
         push: true
         builder: ${{ steps.buildx.outputs.name }}
