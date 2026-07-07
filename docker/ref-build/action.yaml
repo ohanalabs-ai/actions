@@ -70,18 +70,6 @@ runs:
         print(f"Rewrote {n} image field(s) in {path}")
         PY
 
-    - name: Docker metadata - labels only
-      id: meta
-      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
-      with:
-        images: ${{ inputs.image-base }}
-        labels: |
-          org.opencontainers.image.title=${{ github.event.repository.name }}
-          org.opencontainers.image.description=${{ inputs.image-description }}
-          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-          org.opencontainers.image.revision=${{ github.sha }}
-        flavor: latest=false
-
     - name: Compute image tags
       id: image_tags
       shell: bash
@@ -101,6 +89,32 @@ runs:
         } >> "$GITHUB_OUTPUT"
 
     ## Validate if it's a tag or fail
+
+    - name: Docker metadata - labels only
+      id: meta
+      if: inputs.push-latest == 'false'
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+      with:
+        images: ${{ inputs.image-base }}
+        labels: |
+          org.opencontainers.image.title=${{ github.event.repository.name }}
+          org.opencontainers.image.description=${{ inputs.image-description }}
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+        flavor: latest=false
+
+    - name: Docker metadata - labels only
+      id: meta
+      if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-') && inputs.push-latest == 'true'
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+      with:
+        images: ${{ inputs.image-base }}
+        labels: |
+          org.opencontainers.image.title=${{ github.event.repository.name }}
+          org.opencontainers.image.description=${{ inputs.image-description }}
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+        flavor: latest=true
     
     - name: Build and push
       id: bake
