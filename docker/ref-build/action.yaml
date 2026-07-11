@@ -12,6 +12,17 @@ inputs:
   push-attestations: { required: true }
   sbom-file: { required: true }
   push-latest: { required: false, default: "false" }
+
+  # Cache controls
+  cache-enabled: { required: false, default: "true" }
+  cache-mode:
+    required: false
+    default: "auto" # auto|min|max ; auto => max on stable semver tags, min otherwise
+  cache-ignore-error: { required: false, default: "true" }
+  cache-scope:
+    required: false
+    default: "" # optional override. default computed as: <repo>-<target>-<ref>
+
 outputs:
   digest:
     value: ${{ steps.digest.outputs.digest }}
@@ -76,8 +87,6 @@ runs:
         print(f"Rewrote {n} image field(s) in {path}")
         PY
 
-    ## Validate if it's a tag or fail
-
     - name: Docker metadata - labels only
       id: meta
       uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
@@ -108,7 +117,7 @@ runs:
             [ -n "$t" ] || continue
             echo "${TARGET}.tags=${t}"
           done <<< "${INPUT_TAGS}"
-    
+
           # add latest only on stable semver tags and when requested
           if [[ "${PUSH_LATEST}" == "true" ]] && [[ "${REF_TAG}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "${TARGET}.tags=${IMAGE_BASE}:latest"
@@ -116,8 +125,49 @@ runs:
           echo "EOF"
         } >> "$GITHUB_OUTPUT"
 
-    - name: Build and push
-      id: bake
+    - name: Resolve cache policy
+      id: cache
+      shell: bash
+      env:
+        CACHE_ENABLED: ${{ inputs.cache-enabled }}
+        CACHE_MODE_INPUT: ${{ inputs.cache-mode }}
+        CACHE_SCOPE_INPUT: ${{ inputs.cache-scope }}
+        TARGET: ${{ steps.compose-metadata.outputs.target-service }}
+        REPO: ${{ github.repository }}
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        set -euo pipefail
+
+        if [[ "${CACHE_ENABLED}" != "true" ]]; then
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+        case "${CACHE_MODE_INPUT}" in
+          auto)
+            if [[ "${REF_NAME}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              MODE="max"
+            else
+              MODE="min"
+            fi
+            ;;
+          min|max)
+            MODE="${CACHE_MODE_INPUT}"
+            ;;
+          *)
+            MODE="min"
+            ;;
+        esac
+
+        SCOPE="${CACHE_SCOPE_INPUT:-${REPO}-${TARGET}-${REF_NAME}}"
+
+        echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+        echo "scope=${SCOPE}" >> "$GITHUB_OUTPUT"
+
+    - name: Build and push (cache enabled)
+      if: ${{ steps.cache.outputs.enabled == 'true' }}
+      id: bake_cache
       uses: docker/bake-action@4a9a8d494466d37134e2bfca2d3a8de8fb2681ad
       with:
         files: |
@@ -129,23 +179,40 @@ runs:
         set: |
           ${{ steps.compose-metadata.outputs.target-service }}.platform=${{ inputs.platforms }}
           ${{ steps.tag_overrides.outputs.lines }}
-          ${{ steps.compose-metadata.outputs.target-service }}.cache-from=type=gha,scope=${{ steps.compose-metadata.outputs.target-service }}
-          ${{ steps.compose-metadata.outputs.target-service }}.cache-to=type=gha,mode=max,scope=${{ steps.compose-metadata.outputs.target-service }}
+          ${{ steps.compose-metadata.outputs.target-service }}.cache-from=type=gha,scope=${{ steps.cache.outputs.scope }}
+          ${{ steps.compose-metadata.outputs.target-service }}.cache-to=type=gha,mode=${{ steps.cache.outputs.mode }},scope=${{ steps.cache.outputs.scope }},ignore-error=${{ inputs.cache-ignore-error }}
+
+    - name: Build and push (cache disabled)
+      if: ${{ steps.cache.outputs.enabled != 'true' }}
+      id: bake_nocache
+      uses: docker/bake-action@4a9a8d494466d37134e2bfca2d3a8de8fb2681ad
+      with:
+        files: |
+          ${{ inputs.docker-compose-file-name }}
+          ${{ steps.meta.outputs.bake-file-labels }}
+        targets: ${{ steps.compose-metadata.outputs.target-service }}
+        push: true
+        builder: ${{ steps.buildx.outputs.name }}
+        set: |
+          ${{ steps.compose-metadata.outputs.target-service }}.platform=${{ inputs.platforms }}
+          ${{ steps.tag_overrides.outputs.lines }}
 
     - name: Resolve image digest
       id: digest
       shell: bash
       env:
         TARGET_SERVICE: ${{ steps.compose-metadata.outputs.target-service }}
-        # Pass the bake metadata JSON through the environment (NOT inlined into the
-        # shell body). The multi-arch provenance embeds Dockerfile RUN commands with
-        # single quotes and $(...) which break a single-quoted bash string.
-        META_JSON: ${{ steps.bake.outputs.metadata }}
+        META_JSON_CACHE: ${{ steps.bake_cache.outputs.metadata }}
+        META_JSON_NOCACHE: ${{ steps.bake_nocache.outputs.metadata }}
       run: |
         set -euo pipefail
+
+        META_JSON="${META_JSON_CACHE:-$META_JSON_NOCACHE}"
+
         DIGEST=$(printf '%s' "$META_JSON" | jq -r --arg t "$TARGET_SERVICE" '.[$t]["containerimage.digest"] // .["containerimage.digest"] // empty')
         if [ -z "$DIGEST" ]; then
-          echo "::error::Digest not found in bake metadata"; exit 1
+          echo "::error::Digest not found in bake metadata"
+          exit 1
         fi
         echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
@@ -171,4 +238,3 @@ runs:
         sbom-path: ${{ inputs.sbom-file }}
         push-to-registry: ${{ inputs.push-attestations }}
         show-summary: true
-
