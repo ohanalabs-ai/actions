@@ -28,6 +28,10 @@ outputs:
     value: ${{ steps.digest.outputs.digest }}
   labels:
     value: ${{ steps.meta.outputs.labels }}
+  image-base:
+    value: ${{ inputs.image-base }}
+  subject:
+    value: ${{ steps.subject.outputs.subject }}
 
 runs:
   using: composite
