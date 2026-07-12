@@ -2,12 +2,17 @@ name: SLSA report
 description: Verify GitHub artifact attestations for a container image and generate a reusable markdown report.
 
 inputs:
+  subject:
+    description: Full OCI subject in image@digest form
+    required: true
   image-base:
     description: OCI image repository without digest
-    required: true
+    required: false
+    default: ""
   digest:
-    description: OCI digest for the pushed image
-    required: true
+    description: OCI digest for display
+    required: false
+    default: ""
   signer-workflow:
     description: Full signer workflow path or repo-qualified workflow identity accepted by gh attestation verify
     required: true
@@ -62,15 +67,23 @@ runs:
       id: vars
       shell: bash
       env:
+        SUBJECT: ${{ inputs.subject }}
         IMAGE_BASE: ${{ inputs.image-base }}
         DIGEST: ${{ inputs.digest }}
         SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
       run: |
         set -euo pipefail
-        SUBJECT="${IMAGE_BASE}@${DIGEST}"
 
-        echo "image=${IMAGE_BASE}" >> "$GITHUB_OUTPUT"
-        echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+        IMAGE="${IMAGE_BASE}"
+        DIGEST_VALUE="${DIGEST}"
+
+        if [ -z "${IMAGE}" ] || [ -z "${DIGEST_VALUE}" ]; then
+          IMAGE="${SUBJECT%@*}"
+          DIGEST_VALUE="${SUBJECT#*@}"
+        fi
+
+        echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+        echo "digest=${DIGEST_VALUE}" >> "$GITHUB_OUTPUT"
         echo "subject=${SUBJECT}" >> "$GITHUB_OUTPUT"
         echo "signer_workflow=${SIGNER_WORKFLOW}" >> "$GITHUB_OUTPUT"
         echo "slsa_level=3" >> "$GITHUB_OUTPUT"
