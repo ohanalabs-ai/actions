@@ -220,6 +220,16 @@ runs:
         fi
         echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
+    - name: Resolve subject
+      id: subject
+      shell: bash
+      env:
+        IMAGE_BASE: ${{ inputs.image-base }}
+        DIGEST: ${{ steps.digest.outputs.digest }}
+      run: |
+        set -euo pipefail
+        echo "subject=${IMAGE_BASE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
     - name: Attest build provenance
       uses: actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8
       with:
