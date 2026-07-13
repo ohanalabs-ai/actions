@@ -6,7 +6,7 @@ branding:
   icon: watch
 
 inputs:
-  compose-path: 
+  compose-path:
     description: 'The name of the docker compose file'
     required: false
     default: docker-compose.yaml
@@ -18,17 +18,18 @@ inputs:
 outputs:
   target-service:
     description: 'The name of the target service'
-    value: ${{ steps.resolve-target-service.outputs.service }}
+    value: ${{ steps.final-target-service.outputs.service }}
 
 runs:
   using: composite
-  
+
   steps:
     - name: If the file does not exist, fail
       shell: bash
       env:
         DOCKER_COMPOSE_FILE_NAME: ${{ inputs.compose-path }}
       run: |
+        set -euo pipefail
         if [ -z "${DOCKER_COMPOSE_FILE_NAME}" ]; then
           echo "::error::Please set input 'compose-path' to the docker compose file to use, or use the default"
           exit 1
@@ -38,27 +39,54 @@ runs:
           exit 1
         fi
 
-    - name: Resolve target service from compose (when unset)
+    - name: Resolve/validate target service
       id: resolve-target-service
-      if: inputs.target-service == ''
       shell: bash
       env:
         DOCKER_COMPOSE_FILE_NAME: ${{ inputs.compose-path }}
+        TARGET_SERVICE: ${{ inputs.target-service }}
       run: |
         set -euo pipefail
-        mapfile -t SERVICES < <(docker compose -f "${{ env.DOCKER_COMPOSE_FILE_NAME }}" config --services)
+        mapfile -t SERVICES < <(docker compose -f "${DOCKER_COMPOSE_FILE_NAME}" config --services)
 
         if [ "${#SERVICES[@]}" -eq 0 ]; then
-          echo "::error::No services were found in ${{ env.DOCKER_COMPOSE_FILE_NAME }}."
+          echo "::error::No services were found in ${DOCKER_COMPOSE_FILE_NAME}."
           exit 1
+        fi
+
+        if [ -n "${TARGET_SERVICE}" ]; then
+          FOUND=false
+          for svc in "${SERVICES[@]}"; do
+            if [ "${svc}" = "${TARGET_SERVICE}" ]; then
+              FOUND=true
+              break
+            fi
+          done
+
+          if [ "${FOUND}" != "true" ]; then
+            echo "::error::Input 'target-service=${TARGET_SERVICE}' was not found in ${DOCKER_COMPOSE_FILE_NAME}."
+            echo "::error::Available services: ${SERVICES[*]}"
+            exit 1
+          fi
+
+          echo "Using provided target service: ${TARGET_SERVICE}"
+          echo "service=${TARGET_SERVICE}" >> "$GITHUB_OUTPUT"
+          exit 0
         fi
 
         if [ "${#SERVICES[@]}" -eq 1 ]; then
           echo "Single compose service detected: ${SERVICES[0]}"
-          echo "service=${SERVICES[0]}" >> $GITHUB_OUTPUT
+          echo "service=${SERVICES[0]}" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        echo "::error::Multiple services found in ${{ env.DOCKER_COMPOSE_FILE_NAME }}: ${SERVICES[*]}"
+        echo "::error::Multiple services found in ${DOCKER_COMPOSE_FILE_NAME}: ${SERVICES[*]}"
         echo "::error::Please set input 'target-service' to the service you want to build."
         exit 1
+
+    - name: Finalize target service output
+      id: final-target-service
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "service=${{ steps.resolve-target-service.outputs.service }}" >> "$GITHUB_OUTPUT"
