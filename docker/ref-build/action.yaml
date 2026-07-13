@@ -6,6 +6,9 @@ inputs:
   platforms: { required: true }
   docker-compose-context: { required: true }
   docker-compose-file-name: { required: true }
+  target-service:
+    required: false
+    default: ""
   image-base: { required: true }
   image-description: { required: true }
   tags: { required: true }
@@ -41,6 +44,7 @@ runs:
       uses: vionix-proj/actions/docker/compose/metadata@main
       with:
         compose-path: ${{ inputs.docker-compose-file-name }}
+        target-service: ${{ inputs.target-service }}
 
     - name: Verify bake targets from compose file
       shell: bash
