@@ -153,6 +153,8 @@ runs:
         IMAGE: ${{ steps.vars.outputs.image }}
         DIGEST: ${{ steps.vars.outputs.digest }}
         VERIFIED: ${{ steps.verify.outputs.verified }}
+        VERIFY_LOG: ${{ steps.verify.outputs.log }}
+        VERIFY_COMMAND: ${{ steps.vars.outputs.verification_command }}
         SIGNER_WORKFLOW: ${{ steps.vars.outputs.signer_workflow }}
         SLSA_LEVEL: ${{ steps.vars.outputs.slsa_level }}
         REF_NAME: ${{ inputs.ref-name }}
@@ -170,18 +172,33 @@ runs:
         {
           echo "markdown<<EOF"
           echo "## ${TITLE}"
+          echo ""
           echo "- Status: ${STATUS_ICON} ${STATUS_TEXT}"
           echo "- SLSA posture: Level ${SLSA_LEVEL} via reusable workflow verification"
-          echo "- Ref: ${REF_NAME}"
-          echo "- Image: ${IMAGE}"
-          echo "- Digest: ${DIGEST}"
+          echo "- Ref: \`${REF_NAME}\`"
+          echo "- Image: \`${IMAGE}\`"
+          echo "- Digest: \`${DIGEST}\`"
           echo "- Subject: \`${SUBJECT}\`"
           echo "- Signer workflow: \`${SIGNER_WORKFLOW}\`"
+          echo ""
+          echo "### Verify with GitHub CLI"
+          echo ""
+          echo '```bash'
+          printf '%s\n' "${VERIFY_COMMAND}"
+          echo '```'
+          echo ""
+          echo "> Authentication may be required. Run \`gh auth login\` or set \`GH_TOKEN\` before verification."
           echo ""
           echo "<details><summary>Verification details</summary>"
           echo ""
           echo '```text'
-          printf '%s\n' "${{ steps.verify.outputs.log }}"
+
+          if [ -n "${VERIFY_LOG}" ]; then
+            printf '%s\n' "${VERIFY_LOG}"
+          else
+            echo "Verification succeeded. The GitHub CLI did not return additional output."
+          fi
+
           echo '```'
           echo "</details>"
           echo "EOF"
