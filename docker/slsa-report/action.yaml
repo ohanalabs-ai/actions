@@ -1,72 +1,98 @@
 name: SLSA report
-description: Verify GitHub artifact attestations for a container image and generate a reusable markdown report.
+description: Verify GitHub artifact attestations for a container image and generate a reusable Markdown report.
 
 inputs:
   subject:
     description: Full OCI subject in image@digest form
     required: true
+
   image-base:
     description: OCI image repository without digest
     required: false
     default: ""
+
   digest:
     description: OCI digest for display
     required: false
     default: ""
+
   signer-workflow:
-    description: Full signer workflow path or repo-qualified workflow identity accepted by gh attestation verify
+    description: Full signer workflow path or repository-qualified workflow identity accepted by gh attestation verify
     required: true
+
   repo:
     description: Repository owning the subject artifact
     required: false
     default: ${{ github.repository }}
+
   gh-token:
-    description: GitHub token used by gh for verification
+    description: GitHub token used by the GitHub CLI for verification
     required: false
     default: ${{ github.token }}
+
   ref-name:
     description: Git ref associated with the build
     required: false
     default: ${{ github.ref_name }}
+
   title:
     description: Report title
     required: false
     default: SLSA verification
+
   fail-on-unverified:
-    description: Whether to fail if verification fails
+    description: Whether to fail the action when verification fails
     required: false
     default: "true"
+
+  slsa-build-level:
+    description: >-
+      User-declared SLSA Build level for the build pipeline. This value is
+      reported as workflow policy; it is not detected or certified by
+      gh attestation verify.
+    required: false
+    default: "2"
 
 outputs:
   image:
     description: Verified image base
     value: ${{ steps.vars.outputs.image }}
+
   digest:
     description: Verified digest
     value: ${{ steps.vars.outputs.digest }}
+
   subject:
     description: Full image reference with digest
     value: ${{ steps.vars.outputs.subject }}
+
   verified:
-    description: true when attestation verification succeeded
+    description: Whether attestation verification succeeded
     value: ${{ steps.verify.outputs.verified }}
+
   signer_workflow:
     description: Signer workflow used during verification
     value: ${{ steps.vars.outputs.signer_workflow }}
-  slsa_level:
-    description: Claimed SLSA posture
-    value: ${{ steps.vars.outputs.slsa_level }}
+
+  declared_slsa_build_level:
+    description: >-
+      User-declared SLSA Build level. This value was not detected by
+      attestation verification.
+    value: ${{ steps.vars.outputs.declared_slsa_build_level }}
+
   summary_markdown:
-    description: Markdown summary suitable for PR comments or step summaries
+    description: Markdown summary suitable for PR comments, releases, or step summaries
     value: ${{ steps.summary.outputs.markdown }}
+
   verification_command:
-    description: CLI command users can execute to verify the attestation
+    description: GitHub CLI command users can execute to verify the attestation
     value: ${{ steps.vars.outputs.verification_command }}
 
 runs:
   using: composite
+
   steps:
-    - name: Resolve verification vars
+    - name: Resolve verification variables
       id: vars
       shell: bash
       env:
@@ -75,55 +101,89 @@ runs:
         DIGEST: ${{ inputs.digest }}
         SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
         REPO: ${{ inputs.repo }}
+        DECLARED_SLSA_BUILD_LEVEL: ${{ inputs.slsa-build-level }}
       run: |
         set -euo pipefail
+
+        if [ -z "${SUBJECT}" ]; then
+          echo "::error::Input 'subject' must not be empty."
+          exit 1
+        fi
+
+        if [ -z "${SIGNER_WORKFLOW}" ]; then
+          echo "::error::Input 'signer-workflow' must not be empty."
+          exit 1
+        fi
+
+        if [ -z "${REPO}" ]; then
+          echo "::error::Input 'repo' must not be empty."
+          exit 1
+        fi
 
         IMAGE="${IMAGE_BASE}"
         DIGEST_VALUE="${DIGEST}"
 
         if [ -z "${IMAGE}" ] || [ -z "${DIGEST_VALUE}" ]; then
+          if [[ "${SUBJECT}" != *@sha256:* ]]; then
+            echo "::error::Subject must use image@sha256:digest format: ${SUBJECT}"
+            exit 1
+          fi
+
           IMAGE="${SUBJECT%@*}"
           DIGEST_VALUE="${SUBJECT#*@}"
         fi
 
-        VERIFY_SUBJECT="oci://${SUBJECT#oci://}"
+        case "${DECLARED_SLSA_BUILD_LEVEL}" in
+          1|2|3)
+            ;;
+          *)
+            echo "::error::Input 'slsa-build-level' must be 1, 2, or 3."
+            exit 1
+            ;;
+        esac
 
-        echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
-        echo "digest=${DIGEST_VALUE}" >> "$GITHUB_OUTPUT"
-        echo "subject=${SUBJECT}" >> "$GITHUB_OUTPUT"
-        echo "verify_subject=${VERIFY_SUBJECT}" >> "$GITHUB_OUTPUT"
-        echo "signer_workflow=${SIGNER_WORKFLOW}" >> "$GITHUB_OUTPUT"
-        echo "slsa_level=3" >> "$GITHUB_OUTPUT"
+        VERIFY_SUBJECT="oci://${SUBJECT#oci://}"
+        {
+          echo "image=${IMAGE}"
+          echo "digest=${DIGEST_VALUE}"
+          echo "subject=${SUBJECT}"
+          echo "verify_subject=${VERIFY_SUBJECT}"
+          echo "signer_workflow=${SIGNER_WORKFLOW}"
+          echo "declared_slsa_build_level=${DECLARED_SLSA_BUILD_LEVEL}"
+        } >> "$GITHUB_OUTPUT"
+
+        COMMAND_DELIMITER="gh-command-$(date +%s)-${RANDOM}-${RANDOM}"
 
         {
-          echo "verification_command<<EOF"
+          echo "verification_command<<${COMMAND_DELIMITER}"
           printf 'gh attestation verify %q --repo %q --signer-workflow %q\n' \
             "${VERIFY_SUBJECT}" \
             "${REPO}" \
             "${SIGNER_WORKFLOW}"
-          echo "EOF"
+          echo "${COMMAND_DELIMITER}"
         } >> "$GITHUB_OUTPUT"
-
 
     - name: Verify artifact attestation
       id: verify
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.gh-token }}
-        SUBJECT: ${{ steps.vars.outputs.subject }}
+        VERIFY_SUBJECT: ${{ steps.vars.outputs.verify_subject }}
         REPO: ${{ inputs.repo }}
         SIGNER_WORKFLOW: ${{ steps.vars.outputs.signer_workflow }}
         FAIL_ON_UNVERIFIED: ${{ inputs.fail-on-unverified }}
       run: |
-        set +e
+        set -uo pipefail
 
-        VERIFY_SUBJECT="oci://${SUBJECT#oci://}"
-        OUTPUT_FILE="$RUNNER_TEMP/attestation-verify.txt"
+        OUTPUT_FILE="${RUNNER_TEMP}/attestation-verify.txt"
+
+        set +e
         gh attestation verify "${VERIFY_SUBJECT}" \
           --repo "${REPO}" \
           --signer-workflow "${SIGNER_WORKFLOW}" \
-          >"${OUTPUT_FILE}" 2>&1
+          > "${OUTPUT_FILE}" 2>&1
         STATUS=$?
+        set -e
 
         if [ "${STATUS}" -eq 0 ]; then
           echo "verified=true" >> "$GITHUB_OUTPUT"
@@ -131,20 +191,31 @@ runs:
           echo "verified=false" >> "$GITHUB_OUTPUT"
         fi
 
+        LOG_DELIMITER="gh-verify-log-$(date +%s)-${RANDOM}-${RANDOM}"
+
         {
-          echo "log<<EOF"
+          echo "log<<${LOG_DELIMITER}"
           cat "${OUTPUT_FILE}"
-          echo "EOF"
+          echo "${LOG_DELIMITER}"
         } >> "$GITHUB_OUTPUT"
 
-        if [ "${STATUS}" -ne 0 ] && [ "${FAIL_ON_UNVERIFIED}" = "true" ]; then
-          cat "${OUTPUT_FILE}"
-          exit "${STATUS}"
+        if [ "${STATUS}" -ne 0 ]; then
+          if [ -s "${OUTPUT_FILE}" ]; then
+            cat "${OUTPUT_FILE}"
+          else
+            echo "::error::Attestation verification failed without additional GitHub CLI output."
+          fi
+
+          if [ "${FAIL_ON_UNVERIFIED}" = "true" ]; then
+            exit "${STATUS}"
+          fi
+
+          echo "::warning::Attestation verification failed, but fail-on-unverified is false."
         fi
 
         exit 0
 
-    - name: Build markdown report
+    - name: Build Markdown report
       id: summary
       shell: bash
       env:
@@ -156,7 +227,7 @@ runs:
         VERIFY_LOG: ${{ steps.verify.outputs.log }}
         VERIFY_COMMAND: ${{ steps.vars.outputs.verification_command }}
         SIGNER_WORKFLOW: ${{ steps.vars.outputs.signer_workflow }}
-        SLSA_LEVEL: ${{ steps.vars.outputs.slsa_level }}
+        DECLARED_SLSA_BUILD_LEVEL: ${{ steps.vars.outputs.declared_slsa_build_level }}
         REF_NAME: ${{ inputs.ref-name }}
       run: |
         set -euo pipefail
@@ -169,12 +240,21 @@ runs:
           STATUS_TEXT="Verification failed"
         fi
 
+        MARKDOWN_DELIMITER="slsa-markdown-$(date +%s)-${RANDOM}-${RANDOM}"
+
         {
-          echo "markdown<<EOF"
+          echo "markdown<<${MARKDOWN_DELIMITER}"
           echo "## ${TITLE}"
           echo ""
           echo "- Status: ${STATUS_ICON} ${STATUS_TEXT}"
-          echo "- SLSA posture: Level ${SLSA_LEVEL} via reusable workflow verification"
+          echo "- Declared SLSA posture: Build Level ${DECLARED_SLSA_BUILD_LEVEL}"
+          echo "- Attestation verification: ${STATUS_ICON} ${STATUS_TEXT}"
+          echo ""
+          echo "> [!NOTE]"
+          echo "> The SLSA Build level is declared by the workflow caller based on"
+          echo "> the pipeline architecture. GitHub CLI verifies the attestation,"
+          echo "> subject, repository, and signer identity; it does not calculate"
+          echo "> or certify a SLSA Build level."
           echo "- Ref: \`${REF_NAME}\`"
           echo "- Image: \`${IMAGE}\`"
           echo "- Digest: \`${DIGEST}\`"
@@ -195,13 +275,15 @@ runs:
 
           if [ -n "${VERIFY_LOG}" ]; then
             printf '%s\n' "${VERIFY_LOG}"
-          else
+          elif [ "${VERIFIED}" = "true" ]; then
             echo "Verification succeeded. The GitHub CLI did not return additional output."
+          else
+            echo "Verification failed. The GitHub CLI did not return additional diagnostic output."
           fi
 
           echo '```'
           echo "</details>"
-          echo "EOF"
+          echo "${MARKDOWN_DELIMITER}"
         } >> "$GITHUB_OUTPUT"
 
     - name: Append step summary
