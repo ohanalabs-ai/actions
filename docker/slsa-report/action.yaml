@@ -100,8 +100,9 @@ runs:
       run: |
         set +e
 
+        VERIFY_SUBJECT="oci://${SUBJECT#oci://}"
         OUTPUT_FILE="$RUNNER_TEMP/attestation-verify.txt"
-        gh attestation verify "${SUBJECT}" \
+        gh attestation verify "${VERIFY_SUBJECT}" \
           --repo "${REPO}" \
           --signer-workflow "${SIGNER_WORKFLOW}" \
           >"${OUTPUT_FILE}" 2>&1
