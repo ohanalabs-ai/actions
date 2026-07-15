@@ -59,6 +59,9 @@ outputs:
   summary_markdown:
     description: Markdown summary suitable for PR comments or step summaries
     value: ${{ steps.summary.outputs.markdown }}
+  verification_command:
+    description: CLI command users can execute to verify the attestation
+    value: ${{ steps.vars.outputs.verification_command }}
 
 runs:
   using: composite
@@ -71,6 +74,7 @@ runs:
         IMAGE_BASE: ${{ inputs.image-base }}
         DIGEST: ${{ inputs.digest }}
         SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
+        REPO: ${{ inputs.repo }}
       run: |
         set -euo pipefail
 
@@ -82,11 +86,24 @@ runs:
           DIGEST_VALUE="${SUBJECT#*@}"
         fi
 
+        VERIFY_SUBJECT="oci://${SUBJECT#oci://}"
+
         echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
         echo "digest=${DIGEST_VALUE}" >> "$GITHUB_OUTPUT"
         echo "subject=${SUBJECT}" >> "$GITHUB_OUTPUT"
+        echo "verify_subject=${VERIFY_SUBJECT}" >> "$GITHUB_OUTPUT"
         echo "signer_workflow=${SIGNER_WORKFLOW}" >> "$GITHUB_OUTPUT"
         echo "slsa_level=3" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "verification_command<<EOF"
+          printf 'gh attestation verify %q --repo %q --signer-workflow %q\n' \
+            "${VERIFY_SUBJECT}" \
+            "${REPO}" \
+            "${SIGNER_WORKFLOW}"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
 
     - name: Verify artifact attestation
       id: verify
