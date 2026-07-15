@@ -11,6 +11,7 @@ inputs:
     default: ""
   image-base: { required: true }
   image-description: { required: true }
+  ref-sha: { required: true }
   tags: { required: true }
   push-attestations: { required: true }
   sbom-file: { required: true }
@@ -113,6 +114,7 @@ runs:
       env:
         TARGET: ${{ steps.compose-metadata.outputs.target-service }}
         REF_TAG: ${{ github.ref_name }}
+        REF_SHA: ${{ inputs.ref-sha }}
         PUSH_LATEST: ${{ inputs.push-latest }}
         INPUT_TAGS: ${{ inputs.tags }}
         IMAGE_BASE: ${{ inputs.image-base }}
@@ -125,6 +127,9 @@ runs:
             [ -n "$t" ] || continue
             echo "${TARGET}.tags=${t}"
           done <<< "${INPUT_TAGS}"
+
+          # Always add an immutable tag for the supplied commit SHA
+          echo "${TARGET}.tags=${IMAGE_BASE}:${REF_SHA}"
 
           # add latest only on stable semver tags and when requested
           if [[ "${PUSH_LATEST}" == "true" ]] && [[ "${REF_TAG}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
