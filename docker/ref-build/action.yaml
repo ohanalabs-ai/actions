@@ -240,7 +240,11 @@ runs:
         set -euo pipefail
         echo "subject=${IMAGE_BASE}@${DIGEST}" >> "$GITHUB_OUTPUT"
 
+    # Attestation steps require the GitHub Attestations API, which is only available
+    # on paid plans or repos with the feature explicitly enabled. Skip entirely when
+    # push-attestations is not 'true' to avoid API failures on free-plan orgs.
     - name: Attest build provenance
+      if: ${{ inputs.push-attestations == 'true' }}
       uses: actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8
       with:
         subject-name: ${{ inputs.image-base }}
@@ -249,12 +253,14 @@ runs:
         show-summary: true
 
     - name: Generate SBOM
+      if: ${{ inputs.push-attestations == 'true' }}
       uses: anchore/sbom-action@v0.17.3
       with:
         image: ${{ inputs.image-base }}@${{ steps.digest.outputs.digest }}
         output-file: ${{ inputs.sbom-file }}
 
     - name: Attest SBOM
+      if: ${{ inputs.push-attestations == 'true' }}
       uses: actions/attest-sbom@5026d3663739160db546203eeaffa6aa1c51a4d6
       with:
         subject-name: ${{ inputs.image-base }}
