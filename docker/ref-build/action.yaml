@@ -78,7 +78,6 @@ runs:
 
     - name: Rewrite compose images to GHCR only
       shell: bash
-      working-directory: ${{ inputs.docker-compose-context }}
       env:
         GHCR_IMAGE_BASE: ${{ inputs.image-base }}
         FILE: ${{ inputs.docker-compose-file-name }}
@@ -191,6 +190,7 @@ runs:
         builder: ${{ steps.buildx.outputs.name }}
         set: |
           ${{ steps.compose-metadata.outputs.target-service }}.platform=${{ inputs.platforms }}
+          ${{ steps.compose-metadata.outputs.target-service }}.context=${{ inputs.docker-compose-context }}
           ${{ steps.tag_overrides.outputs.lines }}
           ${{ steps.compose-metadata.outputs.target-service }}.cache-from=type=gha,scope=${{ steps.cache.outputs.scope }}
           ${{ steps.compose-metadata.outputs.target-service }}.cache-to=type=gha,mode=${{ steps.cache.outputs.mode }},scope=${{ steps.cache.outputs.scope }},ignore-error=${{ inputs.cache-ignore-error }}
@@ -208,6 +208,7 @@ runs:
         builder: ${{ steps.buildx.outputs.name }}
         set: |
           ${{ steps.compose-metadata.outputs.target-service }}.platform=${{ inputs.platforms }}
+          ${{ steps.compose-metadata.outputs.target-service }}.context=${{ inputs.docker-compose-context }}
           ${{ steps.tag_overrides.outputs.lines }}
 
     - name: Resolve image digest
