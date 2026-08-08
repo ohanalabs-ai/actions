@@ -1,0 +1,78 @@
+name: dockerfile-diagram
+description: 'Generate a Dockerfile layer diagram using dockerfilegraph and upload as CI artifact'
+author: marcello.desales@gmail.com
+branding:
+  color: blue
+  icon: git-commit
+
+inputs:
+  dockerfile:
+    description: 'Dockerfile name within the context directory'
+    required: false
+    default: Dockerfile
+  context:
+    description: 'Directory containing the Dockerfile (mounted as /workspace)'
+    required: false
+    default: '.'
+  service:
+    description: 'docker compose service name — used for artifact naming and display'
+    required: true
+  output:
+    description: 'Output format: png, svg, pdf, dot'
+    required: false
+    default: png
+
+outputs:
+  diagram-path:
+    description: 'Local path to the generated diagram file'
+    value: ${{ steps.generate.outputs.diagram-path }}
+  artifact-url:
+    description: 'GitHub Actions artifact URL (download link to the diagram ZIP)'
+    value: ${{ steps.upload.outputs.artifact-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Pull dockerfilegraph
+      shell: bash
+      run: docker pull ghcr.io/patrickhoefler/dockerfilegraph:0.21.0-alpine
+
+    - name: Generate Dockerfile diagram
+      id: generate
+      shell: bash
+      env:
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        CONTEXT: ${{ inputs.context }}
+        OUTPUT_FORMAT: ${{ inputs.output }}
+      run: |
+        set -euo pipefail
+        CONTEXT_ABS="$(realpath "${CONTEXT}")"
+
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          --workdir /workspace \
+          --volume "${CONTEXT_ABS}":/workspace \
+          ghcr.io/patrickhoefler/dockerfilegraph:0.21.0-alpine \
+          --layers --scratch hidden \
+          --output "${OUTPUT_FORMAT}" \
+          --filename "${DOCKERFILE}"
+
+        # dockerfilegraph writes <basename>.<format> into the working directory
+        BASENAME="$(basename "${DOCKERFILE}")"
+        DIAGRAM="${CONTEXT_ABS}/${BASENAME}.${OUTPUT_FORMAT}"
+
+        if [ ! -f "${DIAGRAM}" ]; then
+          echo "::error::Diagram not generated — expected: ${DIAGRAM}"
+          exit 1
+        fi
+
+        echo "diagram-path=${DIAGRAM}" >> "$GITHUB_OUTPUT"
+        echo "Diagram: ${DIAGRAM} ($(du -sh "${DIAGRAM}" | cut -f1))"
+
+    - name: Upload diagram as workflow artifact
+      id: upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: dockerfile-diagram-${{ inputs.service }}
+        path: ${{ steps.generate.outputs.diagram-path }}
+        retention-days: 30
