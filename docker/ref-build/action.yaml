@@ -42,7 +42,7 @@ runs:
   steps:
     - name: Loads docker compose properties
       id: compose-metadata
-      uses: vionix-proj/actions/docker/compose/metadata@main
+      uses: ohanalabs-ai/actions/docker/compose/metadata@main
       with:
         compose-path: ${{ inputs.docker-compose-file-name }}
         target-service: ${{ inputs.target-service }}
