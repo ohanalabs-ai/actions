@@ -510,7 +510,7 @@ runs:
     - name: AI Docker build impact review
       id: anthropic-review
       if: ${{ steps.guard.outputs.should_run == 'true' && steps.relevance.outputs.should_review == 'true' }}
-      uses: vionix-proj/actions/ai/anthropic/claude-codereviewer@main
+      uses: ohanalabs-ai/actions/ai/anthropic/claude-codereviewer@main
       with:
         anthropic-api-key: ${{ inputs.anthropic-api-key }}
         anthropic-base-url: ${{ inputs.anthropic-base-url }}
