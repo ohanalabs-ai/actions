@@ -113,7 +113,8 @@ outputs:
     value: ${{ steps.vars.outputs.subject }}
 
   verified:
-    description: "true" when an attestation verified; "false" otherwise (see attested_by / status)
+    description: >-
+      "true" when an attestation verified; "false" otherwise (see attested_by / status)
     value: ${{ steps.verify.outputs.verified }}
 
   attested_by:
