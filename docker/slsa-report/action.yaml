@@ -1,5 +1,17 @@
 name: SLSA report
-description: Verify GitHub artifact attestations for a container image and generate a reusable Markdown report.
+description: >-
+  Verify a container image's build provenance — GitHub artifact attestations
+  (gh attestation verify) and/or Sigstore cosign keyless signatures — and
+  generate a reusable Markdown report with the exact consumer verify command.
+
+# Status semantics (see README):
+#   ✅ verified      — an attestation exists and matches (attested_by=github|cosign)
+#   ❕ not attested  — nothing to verify BY DESIGN: attestations-pushed="false"
+#                     (private repo without GitHub Enterprise Cloud, cosign not
+#                     configured). Informational; the step exits 0.
+#   ❌ failed        — an attestation was expected (pushed / cosign configured)
+#                     but does not verify. The only red case (honours
+#                     fail-on-unverified).
 
 inputs:
   subject:
@@ -41,7 +53,9 @@ inputs:
     default: SLSA verification
 
   fail-on-unverified:
-    description: Whether to fail the action when verification fails
+    description: >-
+      Fail the action when an attestation was expected but does not verify
+      (the ❌ case). Never applies to the ❕ not-attested case.
     required: false
     default: "true"
 
@@ -49,9 +63,41 @@ inputs:
     description: >-
       User-declared SLSA Build level for the build pipeline. This value is
       reported as workflow policy; it is not detected or certified by
-      gh attestation verify.
+      gh attestation verify or cosign.
     required: false
     default: "2"
+
+  mechanism:
+    description: >-
+      Which provenance mechanism to verify. github = gh attestation verify only.
+      cosign = cosign verify + cosign verify-attestation only (needs
+      cosign-identity-regexp). auto = try GitHub attestations first; when none
+      exist (404 / no attestations) fall back to cosign if cosign-identity-regexp
+      is set.
+    required: false
+    default: auto
+
+  attestations-pushed:
+    description: >-
+      Whether the build pushed GitHub artifact attestations for this digest.
+      "false" (private repo without GitHub Enterprise Cloud) makes a missing
+      GitHub attestation informational (❕) instead of a failure, and skips the
+      GitHub verify entirely when mechanism=github.
+    required: false
+    default: "true"
+
+  cosign-identity-regexp:
+    description: >-
+      Certificate identity regexp for cosign keyless verification, e.g.
+      '^https://github.com/ohanalabs-ai/github-platform/.github/workflows/docker-multiarch-cicd.yaml@'.
+      Empty disables the cosign path.
+    required: false
+    default: ""
+
+  cosign-oidc-issuer:
+    description: Certificate OIDC issuer for cosign keyless verification
+    required: false
+    default: https://token.actions.githubusercontent.com
 
 outputs:
   image:
@@ -67,8 +113,17 @@ outputs:
     value: ${{ steps.vars.outputs.subject }}
 
   verified:
-    description: Whether attestation verification succeeded
+    description: >-
+      "true" when an attestation verified; "false" otherwise (see attested_by / status)
     value: ${{ steps.verify.outputs.verified }}
+
+  attested_by:
+    description: Mechanism that verified the digest — github | cosign | none
+    value: ${{ steps.verify.outputs.attested_by }}
+
+  status:
+    description: verified | not-attested | failed
+    value: ${{ steps.verify.outputs.status }}
 
   signer_workflow:
     description: Signer workflow used during verification
@@ -85,8 +140,8 @@ outputs:
     value: ${{ steps.summary.outputs.markdown }}
 
   verification_command:
-    description: GitHub CLI command users can execute to verify the attestation
-    value: ${{ steps.vars.outputs.verification_command }}
+    description: The consumer command for the mechanism that verified (gh attestation verify … or cosign verify …)
+    value: ${{ steps.verify.outputs.verification_command }}
 
 runs:
   using: composite
@@ -102,6 +157,8 @@ runs:
         SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
         REPO: ${{ inputs.repo }}
         DECLARED_SLSA_BUILD_LEVEL: ${{ inputs.slsa-build-level }}
+        MECHANISM: ${{ inputs.mechanism }}
+        COSIGN_IDENTITY_RE: ${{ inputs.cosign-identity-regexp }}
       run: |
         set -euo pipefail
 
@@ -117,6 +174,16 @@ runs:
 
         if [ -z "${REPO}" ]; then
           echo "::error::Input 'repo' must not be empty."
+          exit 1
+        fi
+
+        case "${MECHANISM}" in
+          github|cosign|auto) ;;
+          *) echo "::error::Input 'mechanism' must be github, cosign, or auto (got '${MECHANISM}')."; exit 1 ;;
+        esac
+
+        if [ "${MECHANISM}" = "cosign" ] && [ -z "${COSIGN_IDENTITY_RE}" ]; then
+          echo "::error::mechanism=cosign requires 'cosign-identity-regexp'."
           exit 1
         fi
 
@@ -142,6 +209,13 @@ runs:
             ;;
         esac
 
+        # cosign runs only when the plan can reach it: mechanism=cosign, or
+        # mechanism=auto with an identity to verify against.
+        NEED_COSIGN=false
+        if [ "${MECHANISM}" = "cosign" ] || { [ "${MECHANISM}" = "auto" ] && [ -n "${COSIGN_IDENTITY_RE}" ]; }; then
+          NEED_COSIGN=true
+        fi
+
         VERIFY_SUBJECT="oci://${SUBJECT#oci://}"
         {
           echo "image=${IMAGE}"
@@ -150,69 +224,112 @@ runs:
           echo "verify_subject=${VERIFY_SUBJECT}"
           echo "signer_workflow=${SIGNER_WORKFLOW}"
           echo "declared_slsa_build_level=${DECLARED_SLSA_BUILD_LEVEL}"
+          echo "need_cosign=${NEED_COSIGN}"
         } >> "$GITHUB_OUTPUT"
 
-        COMMAND_DELIMITER="gh-command-$(date +%s)-${RANDOM}-${RANDOM}"
+    - name: Install cosign
+      if: steps.vars.outputs.need_cosign == 'true'
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-        {
-          echo "verification_command<<${COMMAND_DELIMITER}"
-          printf 'gh attestation verify %q --repo %q --signer-workflow %q\n' \
-            "${VERIFY_SUBJECT}" \
-            "${REPO}" \
-            "${SIGNER_WORKFLOW}"
-          echo "${COMMAND_DELIMITER}"
-        } >> "$GITHUB_OUTPUT"
-
-    - name: Verify artifact attestation
+    - name: Verify provenance
       id: verify
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.gh-token }}
+        SUBJECT: ${{ steps.vars.outputs.subject }}
         VERIFY_SUBJECT: ${{ steps.vars.outputs.verify_subject }}
         REPO: ${{ inputs.repo }}
         SIGNER_WORKFLOW: ${{ steps.vars.outputs.signer_workflow }}
         FAIL_ON_UNVERIFIED: ${{ inputs.fail-on-unverified }}
+        MECHANISM: ${{ inputs.mechanism }}
+        ATTESTATIONS_PUSHED: ${{ inputs.attestations-pushed }}
+        COSIGN_IDENTITY_RE: ${{ inputs.cosign-identity-regexp }}
+        COSIGN_ISSUER: ${{ inputs.cosign-oidc-issuer }}
+        NEED_COSIGN: ${{ steps.vars.outputs.need_cosign }}
       run: |
         set -uo pipefail
 
-        OUTPUT_FILE="${RUNNER_TEMP}/attestation-verify.txt"
+        LOG="${RUNNER_TEMP}/provenance-verify.txt"
+        : > "${LOG}"
+        ATTESTED_BY="none"
+        STATUS="not-attested"
+        GH_STATUS=""
+        COSIGN_STATUS=""
 
-        set +e
-        gh attestation verify "${VERIFY_SUBJECT}" \
-          --repo "${REPO}" \
-          --signer-workflow "${SIGNER_WORKFLOW}" \
-          > "${OUTPUT_FILE}" 2>&1
-        STATUS=$?
-        set -e
-
-        if [ "${STATUS}" -eq 0 ]; then
-          echo "verified=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "verified=false" >> "$GITHUB_OUTPUT"
+        # --- GitHub artifact attestations -------------------------------------------
+        if [ "${MECHANISM}" = "github" ] || [ "${MECHANISM}" = "auto" ]; then
+          if [ "${ATTESTATIONS_PUSHED}" = "false" ] && [ "${MECHANISM}" = "github" ]; then
+            echo "GitHub attestations: skipped — the build reported attestations-pushed=false (private repository without GitHub Enterprise Cloud)." >> "${LOG}"
+          else
+            {
+              printf '$ gh attestation verify %q --repo %q --signer-workflow %q\n' "${VERIFY_SUBJECT}" "${REPO}" "${SIGNER_WORKFLOW}"
+              gh attestation verify "${VERIFY_SUBJECT}" --repo "${REPO}" --signer-workflow "${SIGNER_WORKFLOW}" 2>&1
+              echo "exit=$?"
+            } >> "${LOG}"
+            GH_STATUS="$(tail -n1 "${LOG}" | sed 's/^exit=//')"
+            if [ "${GH_STATUS}" = "0" ]; then
+              ATTESTED_BY="github"; STATUS="verified"
+            fi
+          fi
         fi
 
-        LOG_DELIMITER="gh-verify-log-$(date +%s)-${RANDOM}-${RANDOM}"
+        # --- cosign keyless (Sigstore) ---------------------------------------------------
+        if [ "${ATTESTED_BY}" = "none" ] && [ "${NEED_COSIGN}" = "true" ]; then
+          {
+            echo
+            printf '$ cosign verify --certificate-identity-regexp %q --certificate-oidc-issuer %q %q\n' "${COSIGN_IDENTITY_RE}" "${COSIGN_ISSUER}" "${SUBJECT}"
+            cosign verify --certificate-identity-regexp "${COSIGN_IDENTITY_RE}" --certificate-oidc-issuer "${COSIGN_ISSUER}" "${SUBJECT}" 2>&1 | head -c 20000
+            SIG=${PIPESTATUS[0]}
+            echo "exit=${SIG}"
+            printf '$ cosign verify-attestation --type slsaprovenance1 --certificate-identity-regexp %q --certificate-oidc-issuer %q %q\n' "${COSIGN_IDENTITY_RE}" "${COSIGN_ISSUER}" "${SUBJECT}"
+            cosign verify-attestation --type slsaprovenance1 --certificate-identity-regexp "${COSIGN_IDENTITY_RE}" --certificate-oidc-issuer "${COSIGN_ISSUER}" "${SUBJECT}" 2>&1 | head -c 20000
+            ATT=${PIPESTATUS[0]}
+            echo "exit=${ATT}"
+            echo "cosign-result=${SIG}/${ATT}"
+          } >> "${LOG}"
+          COSIGN_STATUS="$(tail -n1 "${LOG}" | sed 's/^cosign-result=//')"
+          if [ "${COSIGN_STATUS}" = "0/0" ]; then
+            ATTESTED_BY="cosign"; STATUS="verified"
+          fi
+        fi
 
+        # --- Classify -------------------------------------------------------------------
+        # Something was expected → failed; nothing expected → not-attested (informational).
+        if [ "${STATUS}" != "verified" ]; then
+          EXPECTED=false
+          if [ "${MECHANISM}" != "cosign" ] && [ "${ATTESTATIONS_PUSHED}" = "true" ]; then EXPECTED=true; fi
+          if [ "${NEED_COSIGN}" = "true" ]; then EXPECTED=true; fi
+          if [ "${EXPECTED}" = "true" ]; then STATUS="failed"; fi
+        fi
+
+        case "${ATTESTED_BY}" in
+          github) CMD="$(printf 'gh attestation verify %q --repo %q --signer-workflow %q' "${VERIFY_SUBJECT}" "${REPO}" "${SIGNER_WORKFLOW}")" ;;
+          cosign) CMD="$(printf 'cosign verify --certificate-identity-regexp %q --certificate-oidc-issuer %q %q' "${COSIGN_IDENTITY_RE}" "${COSIGN_ISSUER}" "${SUBJECT}")" ;;
+          *)      CMD="# no provenance to verify for ${SUBJECT} (status: ${STATUS})" ;;
+        esac
+
+        D="verify-$(date +%s)-${RANDOM}-${RANDOM}"
         {
-          echo "log<<${LOG_DELIMITER}"
-          cat "${OUTPUT_FILE}"
-          echo "${LOG_DELIMITER}"
+          echo "verified=$([ "${STATUS}" = verified ] && echo true || echo false)"
+          echo "attested_by=${ATTESTED_BY}"
+          echo "status=${STATUS}"
+          echo "verification_command<<${D}"; printf '%s\n' "${CMD}"; echo "${D}"
+          echo "log<<${D}"; cat "${LOG}"; echo "${D}"
         } >> "$GITHUB_OUTPUT"
 
-        if [ "${STATUS}" -ne 0 ]; then
-          if [ -s "${OUTPUT_FILE}" ]; then
-            cat "${OUTPUT_FILE}"
-          else
-            echo "::error::Attestation verification failed without additional GitHub CLI output."
-          fi
-
-          if [ "${FAIL_ON_UNVERIFIED}" = "true" ]; then
-            exit "${STATUS}"
-          fi
-
-          echo "::warning::Attestation verification failed, but fail-on-unverified is false."
-        fi
-
+        case "${STATUS}" in
+          verified)
+            echo "Provenance verified by ${ATTESTED_BY} for ${SUBJECT}." ;;
+          not-attested)
+            echo "::notice::No provenance for ${SUBJECT} — informational (attestations-pushed=${ATTESTATIONS_PUSHED}, cosign configured=${NEED_COSIGN})." ;;
+          failed)
+            cat "${LOG}"
+            if [ "${FAIL_ON_UNVERIFIED}" = "true" ]; then
+              echo "::error::Provenance verification failed for ${SUBJECT} (mechanism=${MECHANISM}, gh=${GH_STATUS:-skipped}, cosign=${COSIGN_STATUS:-skipped})."
+              exit 1
+            fi
+            echo "::warning::Provenance verification failed for ${SUBJECT}, but fail-on-unverified is false." ;;
+        esac
         exit 0
 
     - name: Build Markdown report
@@ -223,22 +340,23 @@ runs:
         SUBJECT: ${{ steps.vars.outputs.subject }}
         IMAGE: ${{ steps.vars.outputs.image }}
         DIGEST: ${{ steps.vars.outputs.digest }}
-        VERIFIED: ${{ steps.verify.outputs.verified }}
+        STATUS: ${{ steps.verify.outputs.status }}
+        ATTESTED_BY: ${{ steps.verify.outputs.attested_by }}
         VERIFY_LOG: ${{ steps.verify.outputs.log }}
-        VERIFY_COMMAND: ${{ steps.vars.outputs.verification_command }}
+        VERIFY_COMMAND: ${{ steps.verify.outputs.verification_command }}
         SIGNER_WORKFLOW: ${{ steps.vars.outputs.signer_workflow }}
         DECLARED_SLSA_BUILD_LEVEL: ${{ steps.vars.outputs.declared_slsa_build_level }}
         REF_NAME: ${{ inputs.ref-name }}
+        MECHANISM: ${{ inputs.mechanism }}
+        ATTESTATIONS_PUSHED: ${{ inputs.attestations-pushed }}
       run: |
         set -euo pipefail
 
-        if [ "${VERIFIED}" = "true" ]; then
-          STATUS_ICON="✅"
-          STATUS_TEXT="Verified"
-        else
-          STATUS_ICON="❌"
-          STATUS_TEXT="Verification failed"
-        fi
+        case "${STATUS}" in
+          verified)     STATUS_ICON="✅"; STATUS_TEXT="Verified (${ATTESTED_BY})" ;;
+          not-attested) STATUS_ICON="❕"; STATUS_TEXT="Not attested — informational (attestations-pushed=${ATTESTATIONS_PUSHED}; GitHub Artifact Attestations on a private repository need GitHub Enterprise Cloud, and cosign keyless was not configured)" ;;
+          *)            STATUS_ICON="❌"; STATUS_TEXT="Verification failed — an attestation was expected (mechanism=${MECHANISM}) but does not verify" ;;
+        esac
 
         MARKDOWN_DELIMITER="slsa-markdown-$(date +%s)-${RANDOM}-${RANDOM}"
 
@@ -247,27 +365,37 @@ runs:
           echo "## ${TITLE}"
           echo ""
           echo "- Status: ${STATUS_ICON} ${STATUS_TEXT}"
+          echo "- Attested by: \`${ATTESTED_BY}\`"
           echo "- Declared SLSA posture: Build Level ${DECLARED_SLSA_BUILD_LEVEL}"
-          echo "- Attestation verification: ${STATUS_ICON} ${STATUS_TEXT}"
           echo ""
           echo "> [!NOTE]"
           echo "> The SLSA Build level is declared by the workflow caller based on"
-          echo "> the pipeline architecture. GitHub CLI verifies the attestation,"
-          echo "> subject, repository, and signer identity; it does not calculate"
-          echo "> or certify a SLSA Build level."
+          echo "> the pipeline architecture. \`gh attestation verify\` / \`cosign verify\`"
+          echo "> check the attestation, subject and signer identity; they do not"
+          echo "> calculate or certify a SLSA Build level."
           echo "- Ref: \`${REF_NAME}\`"
           echo "- Image: \`${IMAGE}\`"
           echo "- Digest: \`${DIGEST}\`"
           echo "- Subject: \`${SUBJECT}\`"
           echo "- Signer workflow: \`${SIGNER_WORKFLOW}\`"
           echo ""
-          echo "### Verify with GitHub CLI"
+          if [ "${ATTESTED_BY}" = "github" ]; then
+            echo "### Verify with GitHub CLI"
+          elif [ "${ATTESTED_BY}" = "cosign" ]; then
+            echo "### Verify with cosign (Sigstore keyless)"
+          else
+            echo "### Verify"
+          fi
           echo ""
           echo '```bash'
           printf '%s\n' "${VERIFY_COMMAND}"
           echo '```'
           echo ""
-          echo "> Authentication may be required. Run \`gh auth login\` or set \`GH_TOKEN\` before verification."
+          if [ "${ATTESTED_BY}" = "github" ]; then
+            echo "> Authentication may be required. Run \`gh auth login\` or set \`GH_TOKEN\` before verification."
+          elif [ "${ATTESTED_BY}" = "cosign" ]; then
+            echo "> Needs \`cosign\` (https://github.com/sigstore/cosign) and registry read access (\`docker login\`); verification is against the Sigstore public-good Fulcio/Rekor."
+          fi
           echo ""
           echo "<details><summary>Verification details</summary>"
           echo ""
@@ -275,10 +403,8 @@ runs:
 
           if [ -n "${VERIFY_LOG}" ]; then
             printf '%s\n' "${VERIFY_LOG}"
-          elif [ "${VERIFIED}" = "true" ]; then
-            echo "Verification succeeded. The GitHub CLI did not return additional output."
           else
-            echo "Verification failed. The GitHub CLI did not return additional diagnostic output."
+            echo "No verifier output (status: ${STATUS})."
           fi
 
           echo '```'
